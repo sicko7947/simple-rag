@@ -71,7 +71,7 @@ This RAG system includes components for:
 
 1. Clone this repository:
 ```bash
-git clone [your-repository-url]
+git clone https://github.com/sicko7947/simple-rag
 cd simple-rag
 ```
 
