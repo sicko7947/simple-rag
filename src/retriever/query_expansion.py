@@ -13,12 +13,12 @@ logger = logging.getLogger(__name__)
 class QueryExpander:
     """Expands user queries to improve retrieval performance"""
     
-    def __init__(self, hyde_enabled: bool = True, use_stored_queries: bool = True):
+    def __init__(self, hyde_enabled: bool = True, use_stored_queries: bool = True, vector_store: Optional[Any] = None):
         self.hyde_enabled = hyde_enabled and os.getenv("ENABLE_HYDE", "true").lower() == "true"
         self.use_stored_queries = use_stored_queries
         self.llm_provider = os.getenv("DEFAULT_LLM", "openai")
-        # Use the factory to create the appropriate vector store
-        self.vector_store = SupabaseVectorStore()
+        # Use the provided vector_store or create a new one if not provided
+        self.vector_store = vector_store if vector_store is not None else SupabaseVectorStore()
         
         # Set up appropriate client for HyDE
         if self.hyde_enabled:

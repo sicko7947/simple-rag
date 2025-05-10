@@ -13,19 +13,19 @@ logger = logging.getLogger(__name__)
 class GuardrailsValidator:
     """Validates and fact-checks information using guardrails"""
     
-    def __init__(self):
+    def __init__(self, model_interface: Optional[Any] = None):
         self.enabled = os.getenv("ENABLE_GUARDRAILS", "true").lower() == "true"
         self.conflict_threshold = float(os.getenv("CONFLICT_THRESHOLD", "0.8"))  # Similarity threshold for conflict detection
         self.fact_check_enabled = os.getenv("ENABLE_FACT_CHECK", "true").lower() == "true"
         self.risk_rules_enabled = os.getenv("ENABLE_RISK_RULES", "true").lower() == "true"
         
-        try:
-            # Initialize model for semantic evaluation if needed
-            if self.fact_check_enabled:
-                self.model_interface = ModelInterface()
-        except Exception as e:
-            logger.warning(f"Failed to initialize ModelInterface for fact checking: {str(e)}")
-            self.fact_check_enabled = False
+        # Use provided model_interface or create a new one if needed
+        if self.fact_check_enabled:
+            try:
+                self.model_interface = model_interface if model_interface is not None else ModelInterface()
+            except Exception as e:
+                logger.warning(f"Failed to initialize ModelInterface for fact checking: {str(e)}")
+                self.fact_check_enabled = False
         
         # Initialize risk rules
         self.risk_rules = self._initialize_risk_rules()

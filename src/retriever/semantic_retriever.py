@@ -18,11 +18,11 @@ class SemanticRetriever:
         top_k: int = 5,
         enable_reranking: bool = True,
         reranking_threshold: float = 0.7,
-        vector_store_type: Optional[str] = None
+        vector_store: Optional[Any] = None
     ):
         self.embedding_generator = EmbeddingGenerator()
-        # Use the factory to create the appropriate vector store
-        self.vector_store = SupabaseVectorStore()
+        # Use the provided vector_store or create a new one if not provided
+        self.vector_store = vector_store if vector_store is not None else SupabaseVectorStore()
         self.top_k = top_k
         self.enable_reranking = enable_reranking
         self.reranking_threshold = reranking_threshold

@@ -3,6 +3,7 @@ Web Interface for the RAG system using FastAPI
 """
 import os
 import logging
+import shutil
 import tempfile
 import uvicorn
 import psutil
@@ -12,7 +13,7 @@ import json
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header, Request, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -48,13 +49,16 @@ app.add_middleware(
 # Dictionary to store user-specific agents
 conversation_agents: Dict[str, Dict[str, Any]] = {}
 
+# Lock for thread-safe agent management
+agent_management_lock = asyncio.Lock()
+
 # Agent lifecycle settings
 AGENT_IDLE_TIMEOUT = int(os.getenv("AGENT_IDLE_TIMEOUT", "1800"))  # 30 minutes by default
 AGENT_ABSOLUTE_TIMEOUT = int(os.getenv("AGENT_ABSOLUTE_TIMEOUT", "10800"))  # 3 hours by default
 MAX_AGENTS = int(os.getenv("MAX_AGENTS", "100"))  # Maximum number of agents to keep in memory
 MEMORY_THRESHOLD = int(os.getenv("MEMORY_THRESHOLD", "80"))  # Memory utilization percentage threshold
 
-def cleanup_agents(force_cleanup: bool = False) -> int:
+async def cleanup_agents(force_cleanup: bool = False) -> int:
     """
     Clean up agents based on various criteria:
     - Idle timeout
@@ -65,71 +69,84 @@ def cleanup_agents(force_cleanup: bool = False) -> int:
     Returns:
         Number of agents removed
     """
-    current_time = time.time()
-    agents_to_remove = []
-    
-    # Check memory usage if monitoring is enabled
-    memory_pressure = False
-    try:
-        memory_percent = psutil.virtual_memory().percent
-        if memory_percent > MEMORY_THRESHOLD:
-            memory_pressure = True
-            logger.warning(f"Memory pressure detected: {memory_percent}% used, exceeding {MEMORY_THRESHOLD}% threshold")
-    except Exception as e:
-        logger.error(f"Error checking memory usage: {str(e)}")
-    
-    # First pass: identify agents to remove based on timeouts
-    for cid, agent_data in conversation_agents.items():
-        # Check for idle timeout
-        if current_time - agent_data["last_access"] > AGENT_IDLE_TIMEOUT:
-            agents_to_remove.append((cid, "idle timeout"))
-            continue
-            
-        # Check for absolute timeout
-        if current_time - agent_data["creation_time"] > AGENT_ABSOLUTE_TIMEOUT:
-            agents_to_remove.append((cid, "absolute timeout"))
-            continue
-    
-    # If we're still over the limit or under memory pressure, remove oldest agents
-    if (len(conversation_agents) - len(agents_to_remove) > MAX_AGENTS) or memory_pressure or force_cleanup:
-        # Sort remaining agents by last access time
-        remaining_agents = [(cid, data) for cid, data in conversation_agents.items() 
-                            if cid not in [cid for cid, _ in agents_to_remove]]
-        remaining_agents.sort(key=lambda x: x[1]["last_access"])
+    async with agent_management_lock:  # Protect the entire cleanup logic
+        current_time = time.time()
+        agents_to_remove = []
         
-        # Calculate how many more to remove
-        extra_to_remove = 0
-        if len(conversation_agents) - len(agents_to_remove) > MAX_AGENTS:
-            extra_to_remove = len(conversation_agents) - len(agents_to_remove) - MAX_AGENTS
-            logger.info(f"Need to remove {extra_to_remove} more agents to stay under MAX_AGENTS limit")
+        # Check memory usage if monitoring is enabled
+        memory_pressure = False
+        try:
+            memory_percent = psutil.virtual_memory().percent
+            if memory_percent > MEMORY_THRESHOLD:
+                memory_pressure = True
+                logger.warning(f"Memory pressure detected: {memory_percent}% used, exceeding {MEMORY_THRESHOLD}% threshold")
+        except Exception as e:
+            logger.error(f"Error checking memory usage: {str(e)}")
         
-        # If there's memory pressure, remove at least 10% of agents
-        if memory_pressure:
-            memory_remove_count = max(1, len(conversation_agents) // 10)
-            extra_to_remove = max(extra_to_remove, memory_remove_count)
-            logger.info(f"Memory pressure: will remove at least {memory_remove_count} agents")
-        
-        # If force_cleanup is True, remove an additional 20% of agents
-        if force_cleanup:
-            force_remove_count = max(1, len(conversation_agents) // 5)
-            extra_to_remove = max(extra_to_remove, force_remove_count)
-            logger.info(f"Force cleanup: will remove at least {force_remove_count} agents")
-        
-        # Add oldest agents to removal list
-        for i in range(min(extra_to_remove, len(remaining_agents))):
-            agents_to_remove.append((remaining_agents[i][0], "resource management"))
-    
-    # Remove the identified agents
-    for cid, reason in agents_to_remove:
-        logger.info(f"Removing agent for conversation {cid} due to {reason}")
-        del conversation_agents[cid]
-    
-    if agents_to_remove:
-        logger.info(f"Cleaned up {len(agents_to_remove)} agents, {len(conversation_agents)} remaining")
-        
-    return len(agents_to_remove)
+        # Create a copy of items for safe iteration
+        agents_copy = list(conversation_agents.items())
 
-def get_agent_by_conversation(conversation_id: str) -> CognitiveAgent:
+        # First pass: identify agents to remove based on timeouts
+        for cid, agent_data in agents_copy:
+            # Check for idle timeout
+            if current_time - agent_data["last_access"] > AGENT_IDLE_TIMEOUT:
+                if cid not in [c for c, _ in agents_to_remove]:  # Avoid duplicates
+                    agents_to_remove.append((cid, "idle timeout"))
+                continue
+                
+            # Check for absolute timeout
+            if current_time - agent_data["creation_time"] > AGENT_ABSOLUTE_TIMEOUT:
+                if cid not in [c for c, _ in agents_to_remove]:  # Avoid duplicates
+                    agents_to_remove.append((cid, "absolute timeout"))
+                continue
+        
+        # If we're still over the limit or under memory pressure, remove oldest agents
+        current_agent_count = len(conversation_agents) - len(set(c for c, _ in agents_to_remove))  # Count unique agents to be removed
+        
+        if (current_agent_count > MAX_AGENTS) or memory_pressure or force_cleanup:
+            # Sort remaining agents by last access time
+            remaining_agents = [(cid, data) for cid, data in agents_copy
+                                if cid not in [c for c, _ in agents_to_remove]]
+            remaining_agents.sort(key=lambda x: x[1]["last_access"])
+            
+            # Calculate how many more to remove
+            extra_to_remove_count = 0
+            if current_agent_count > MAX_AGENTS:
+                extra_to_remove_count = current_agent_count - MAX_AGENTS
+                logger.info(f"Need to remove {extra_to_remove_count} more agents to stay under MAX_AGENTS limit")
+            
+            # If there's memory pressure, remove at least 10% of current agents
+            if memory_pressure:
+                memory_remove_target = max(1, len(conversation_agents) // 10)
+                extra_to_remove_count = max(extra_to_remove_count, memory_remove_target)
+                logger.info(f"Memory pressure: will remove at least {memory_remove_target} agents")
+            
+            # If force_cleanup is True, remove an additional 20% of current agents
+            if force_cleanup:
+                force_remove_target = max(1, len(conversation_agents) // 5)
+                extra_to_remove_count = max(extra_to_remove_count, force_remove_target)
+                logger.info(f"Force cleanup: will remove at least {force_remove_target} agents")
+            
+            # Add oldest agents to removal list (ensure not already added)
+            for i in range(min(extra_to_remove_count, len(remaining_agents))):
+                cid_to_remove = remaining_agents[i][0]
+                if cid_to_remove not in [c for c, _ in agents_to_remove]:
+                     agents_to_remove.append((cid_to_remove, "resource management"))
+        
+        removed_count = 0
+        # Remove the identified agents
+        for cid, reason in agents_to_remove:
+            if cid in conversation_agents:  # Check if still exists
+                logger.info(f"Removing agent for conversation {cid} due to {reason}")
+                del conversation_agents[cid]
+                removed_count += 1
+        
+        if removed_count > 0:
+            logger.info(f"Cleaned up {removed_count} agents, {len(conversation_agents)} remaining")
+            
+        return removed_count
+
+async def get_agent_by_conversation(conversation_id: str) -> CognitiveAgent:
     """
     Get or create a CognitiveAgent for the specific conversation
     
@@ -139,37 +156,39 @@ def get_agent_by_conversation(conversation_id: str) -> CognitiveAgent:
     Returns:
         CognitiveAgent instance for this conversation
     """
-    current_time = time.time()
+    # Run agent cleanup (now an async function)
+    await cleanup_agents()
     
-    # Run agent cleanup
-    cleanup_agents()
-    
-    # Get or create agent for current conversation
-    if conversation_id not in conversation_agents:
-        # If we're at max capacity, force a cleanup
-        if len(conversation_agents) >= MAX_AGENTS:
-            logger.warning(f"Reached maximum agent capacity ({MAX_AGENTS}), forcing cleanup")
-            if cleanup_agents(force_cleanup=True) == 0:
-                # If no agents were cleaned up, remove the oldest one
-                oldest_conv_id = min(conversation_agents.items(), key=lambda x: x[1]["last_access"])[0]
-                logger.warning(f"Force removing oldest agent for conversation {oldest_conv_id}")
-                del conversation_agents[oldest_conv_id]
+    async with agent_management_lock:  # Protect dictionary access
+        current_time = time.time()
         
-        logger.info(f"Creating new agent for conversation {conversation_id}")
-        conversation_agents[conversation_id] = {
-            "agent": CognitiveAgent(),
-            "last_access": current_time,
-            "creation_time": current_time,
-            "request_count": 1
-        }
-    else:
-        logger.info(f"Using existing agent for conversation {conversation_id}")
-        conversation_agents[conversation_id]["last_access"] = current_time
-        conversation_agents[conversation_id]["request_count"] += 1
-        
-    return conversation_agents[conversation_id]["agent"]
+        # Get or create agent for current conversation
+        if conversation_id not in conversation_agents:
+            # If we're at max capacity, force a cleanup
+            if len(conversation_agents) >= MAX_AGENTS:
+                logger.warning(f"Reached maximum agent capacity ({MAX_AGENTS}), forcing cleanup")
+                if await cleanup_agents(force_cleanup=True) == 0:  # Use await with async function
+                    # If no agents were cleaned up, remove the oldest one
+                    if conversation_agents:  # Ensure dict is not empty
+                        oldest_conv_id = min(conversation_agents.items(), key=lambda x: x[1]["last_access"])[0]
+                        logger.warning(f"Force removing oldest agent for conversation {oldest_conv_id}")
+                        del conversation_agents[oldest_conv_id]
+            
+            logger.info(f"Creating new agent for conversation {conversation_id}")
+            conversation_agents[conversation_id] = {
+                "agent": CognitiveAgent(),
+                "last_access": current_time,
+                "creation_time": current_time,
+                "request_count": 1
+            }
+        else:
+            logger.info(f"Using existing agent for conversation {conversation_id}")
+            conversation_agents[conversation_id]["last_access"] = current_time
+            conversation_agents[conversation_id]["request_count"] += 1
+            
+        return conversation_agents[conversation_id]["agent"]
 
-def get_or_create_agent(request: Request) -> CognitiveAgent:
+async def get_or_create_agent(request: Request) -> CognitiveAgent:
     """
     Get or create a CognitiveAgent based on request headers
     Maintained for backward compatibility with existing endpoints
@@ -186,8 +205,8 @@ def get_or_create_agent(request: Request) -> CognitiveAgent:
         conversation_id = user_id if user_id else str(uuid.uuid4())
         logger.info(f"No conversation_id in headers, using user_id or generated ID: {conversation_id}")
     
-    # Use the conversation-based agent manager
-    return get_agent_by_conversation(conversation_id)
+    # Use the conversation-based agent manager (now an async function)
+    return await get_agent_by_conversation(conversation_id)
 
 # Define request and response models
 class MessageContent(BaseModel):
@@ -229,36 +248,39 @@ async def upload_document(
     """
     Upload a document to process and store
     """
+    temp_path = None  # Initialize temp_path
     try:
-        # Read the uploaded file
-        file_content = await file.read()
         file_name = file.filename
         
-        # Create a temporary file
+        # Create a temporary file and stream content to it
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(file_content)
             temp_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)  # Stream the file content
         
-        try:
-            # Process the document
-            result = agent.process_document(file_name, file_content)
+        # Read content from the temp file for processing if agent needs bytes
+        with open(temp_path, "rb") as f_content:
+            file_content_for_agent = f_content.read()
+
+        # Process the document
+        result = agent.process_document(file_name, file_content_for_agent)
+        
+        if not result["success"]:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Error processing document: {result.get('error', 'Unknown error')}"
+            )
             
-            if not result["success"]:
-                raise HTTPException(
-                    status_code=500, 
-                    detail=f"Error processing document: {result.get('error', 'Unknown error')}"
-                )
-                
-            return result
-            
-        finally:
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                
+        return result
+        
     except Exception as e:
         logger.error(f"Error uploading document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temp file
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        if hasattr(file, 'close'):  # Ensure the UploadFile is closed
+            file.file.close()
 
 @app.post("/query", response_model=Dict[str, Any])
 async def query(
@@ -278,7 +300,7 @@ async def query(
         print(conversation_id)
         
         # Get or create agent for this conversation
-        agent = get_agent_by_conversation(conversation_id)
+        agent = await get_agent_by_conversation(conversation_id)
         
         # Extract the latest user message from the messages array
         latest_message = query_request.messages[-1]
@@ -425,12 +447,12 @@ async def get_system_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/system/cleanup")
-async def force_cleanup():
+async def force_cleanup_endpoint():  # Renamed to avoid conflict with function
     """
     Force cleanup of idle agents
     """
     try:
-        removed_count = cleanup_agents(force_cleanup=True)
+        removed_count = await cleanup_agents(force_cleanup=True)  # Await the async call
         return {
             "success": True, 
             "removed_agents": removed_count,
@@ -444,7 +466,7 @@ async def force_cleanup():
 @app.post("/chat")
 async def chat(
     chat_request: ChatRequest,
-    stream: bool = False
+    stream: bool = Query(False, description="Whether to stream the response")
 ):
     """
     Process a chat request from the frontend
@@ -463,7 +485,7 @@ async def chat(
             logger.info(f"No conversation ID provided, generated new ID: {conversation_id}")
         
         # Get or create agent for this conversation
-        agent = get_agent_by_conversation(conversation_id)
+        agent = await get_agent_by_conversation(conversation_id)  # Properly await async function
         
         # Extract the latest user message from the messages array
         latest_message = chat_request.messages[-1]
@@ -488,15 +510,7 @@ async def chat(
         # Update the agent's conversation history
         agent.conversation_history = chat_history
         
-        # If streaming is requested, handle with StreamingResponse
-        if stream:
-            # Process the query with streaming
-            return StreamingResponse(
-                chat_streaming_generator(agent, query, conversation_id),
-                media_type="text/event-stream"
-            )
-        
-        # Non-streaming path
+        # Process the query first to get the result regardless of streaming mode
         result = agent.answer_query(
             query=query,
             conversation_id=conversation_id
@@ -507,8 +521,15 @@ async def chat(
                 status_code=500,
                 detail=f"Error processing query: {result.get('error', 'Unknown error')}"
             )
+            
+        # If streaming is requested, stream the already computed result
+        if stream:
+            return StreamingResponse(
+                chat_streaming_generator_with_result(result, conversation_id),
+                media_type="text/event-stream"
+            )
         
-        # Format the response in the expected structure
+        # Format the response in the expected structure for non-streaming mode
         response = {
             "id": conversation_id,
             "content": result["response"],
@@ -520,42 +541,41 @@ async def chat(
         return response
         
     except Exception as e:
-        print(e)
         logger.error(f"Error processing chat request: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def chat_streaming_generator(agent: CognitiveAgent, query: str, conversation_id: str):
+async def chat_streaming_generator_with_result(result: Dict[str, Any], conversation_id: str):
     """
-    Generate streaming response in the format expected by AI SDK
+    Generate streaming response using a pre-computed result
     
     Args:
-        agent: The cognitive agent instance
-        query: User query
+        result: The pre-computed query result
         conversation_id: Conversation ID
         
     Yields:
         Formatted SSE messages compatible with AI SDK
     """
     message_id = str(uuid.uuid4())
+    sources = result.get("sources", [])
     
     try:
-        # Process the query first to get the full response
-        result = agent.answer_query(
-            query=query,
-            conversation_id=conversation_id
-        )
-        
-        if not result["success"]:
-            response_text = "I encountered an error while processing your request."
-        else:
-            response_text = result["response"]
+        response_text = result["response"] if result["success"] else "I encountered an error while processing your request."
         
         # AI SDK expects this specific format:
         # Each SSE message needs to be prefixed with "data: " and end with "\n\n"
         # The content needs to be valid JSON with specific fields
 
-        # 1. Send metadata with model info
-        yield f"data: {{\"role\":\"assistant\",\"id\":\"{message_id}\",\"createdAt\":{int(time.time())},\"content\":\"\",\"model\":\"rag-model\"}}\n\n"
+        # 1. Send metadata with model info and include sources from the start
+        initial_data = {
+            "role": "assistant",
+            "id": message_id,
+            "createdAt": datetime.now().isoformat(),
+            "content": "",
+            "sources": sources,  # Include sources field from the start
+            "success": result["success"],  # Include success field for consistency
+            "model": "rag-model"
+        }
+        yield f"data: {json.dumps(initial_data)}\n\n"
         
         # 2. Stream the response token by token
         tokens = response_text.split()
@@ -569,12 +589,14 @@ async def chat_streaming_generator(agent: CognitiveAgent, query: str, conversati
             
             full_text += chunk
             
-            # AI SDK format for text delta
+            # AI SDK format for text delta - now including sources in each delta
             delta_data = {
                 "role": "assistant",
                 "id": message_id,
-                "createdAt": int(time.time()),
+                "createdAt": datetime.now().isoformat(),
                 "content": full_text,
+                "sources": sources,  # Include sources in each message
+                "success": result["success"],
                 "model": "rag-model"
             }
             
@@ -582,8 +604,7 @@ async def chat_streaming_generator(agent: CognitiveAgent, query: str, conversati
             yield f"data: {json.dumps(delta_data)}\n\n"
             await asyncio.sleep(0.05)  # Small delay to simulate real streaming
         
-        # 3. Add sources as footnotes in the final response if available
-        sources = result.get("sources", [])
+        # We still want to include source information in the content for display purposes
         if sources:
             source_text = "\n\nSources:\n"
             for i, source in enumerate(sources[:3]):  # Limit to top 3 sources
@@ -596,15 +617,17 @@ async def chat_streaming_generator(agent: CognitiveAgent, query: str, conversati
                 
                 source_text += source_info + "\n"
                 
-            # Update the final response with source information
+            # Update the final response with source information in content
             full_text += source_text
             
-            # Send the final complete response with sources
+            # Send the final complete response
             final_data = {
                 "role": "assistant",
                 "id": message_id,
-                "createdAt": int(time.time()),
+                "createdAt": datetime.now().isoformat(),
                 "content": full_text,
+                "sources": sources,  # Include sources object
+                "success": result["success"],
                 "model": "rag-model"
             }
             
@@ -622,6 +645,8 @@ async def chat_streaming_generator(agent: CognitiveAgent, query: str, conversati
             "id": message_id,
             "createdAt": int(time.time()),
             "content": f"Error generating response: {str(e)}",
+            "sources": [],  # Empty sources for error case
+            "success": False,
             "model": "rag-model"
         }
         

@@ -16,14 +16,17 @@ class PromptManager:
             "You are a helpful AI assistant that answers questions based on provided context. "
             "Be accurate, helpful, concise, and only respond based on the provided context. "
             "If the context doesn't contain the information needed, say you don't know rather than making up an answer. "
-            "Always cite your sources when providing information by adding a citation marker like [Doc1], [Doc2], etc. "
-            "at the end of sentences or paragraphs that reference information from that source."
+            "Always cite your sources when providing information by adding a citation marker like [doc_0], [doc_1], etc. "
+            "at the end of sentences or paragraphs that reference information from that source. "
+            "Format your responses using Markdown to improve readability. Use headings, bold text, "
+            "bullet points, numbered lists, and code blocks where appropriate."
         )
         
         self.default_chat_system_prompt = (
             "You are a helpful AI assistant. Respond to the user in a helpful, accurate, "
             "and thoughtful manner. When you don't know the answer, admit it rather than "
-            "making up information."
+            "making up information. Format your responses using Markdown to improve readability. "
+            "Use headings, bold text, bullet points, numbered lists, and code blocks where appropriate."
         )
         
     def create_rag_prompt(
@@ -79,7 +82,17 @@ CONTEXT:
 QUESTION:
 {query}
 
-Please provide a detailed answer with relevant information from the context. If the information is not in the context, let me know you don't have enough information to answer. Include citation markers like [Doc1] after statements that reference information from a specific source.
+Please provide a detailed answer with relevant information from the context. If the information is not in the context, let me know you don't have enough information to answer. Include citation markers like [doc_0] after statements that reference information from a specific source.
+
+FORMAT YOUR RESPONSE IN MARKDOWN:
+- Use ## for section headings
+- Use **bold** for emphasis
+- Use bullet points and numbered lists where appropriate
+- Use `code blocks` for technical terms or code
+- Use > for quoted text from the documents
+- Organize information in a clear, structured format
+
+Please ensure your entire response is properly formatted in Markdown for easy reading and display on the frontend.
 """
         
         messages.append({"role": "user", "content": user_message})
@@ -140,7 +153,8 @@ Please provide a detailed answer with relevant information from the context. If 
         system_prompt = (
             "You are a logical analysis expert. Your task is to identify factual or logical conflicts "
             "between different passages of text. Focus only on clear contradictions in facts, figures, "
-            "dates, or logical reasoning. Minor differences in perspective or emphasis are not conflicts."
+            "dates, or logical reasoning. Minor differences in perspective or emphasis are not conflicts. "
+            "Format your analysis using Markdown for better readability."
         )
         
         formatted_texts = "\n\n".join([f"PASSAGE {i+1}:\n{text}" for i, text in enumerate(texts)])
@@ -151,6 +165,12 @@ Please provide a detailed answer with relevant information from the context. If 
 
 Identify any direct contradictions between these passages. If you find conflicts, explain each conflict clearly. 
 If there are no conflicts, state that the passages are consistent with each other.
+
+FORMAT YOUR RESPONSE IN MARKDOWN:
+- Use ## for section headings
+- Use **bold** for important conflicts or conclusions
+- Use bullet points to list individual conflicts
+- Use > for direct quotes from passages that conflict with each other
 """
         
         messages = [
@@ -184,7 +204,8 @@ If there are no conflicts, state that the passages are consistent with each othe
         system_prompt = (
             "You are a fact-checking expert. Your task is to verify that statements in the RESPONSE "
             "are supported by the provided SOURCE DOCUMENTS. Identify any claims in the response that "
-            "are not supported by or contradict the sources. Focus on factual accuracy only."
+            "are not supported by or contradict the sources. Focus on factual accuracy only. "
+            "Format your analysis using Markdown for better readability."
         )
         
         formatted_sources = "\n\n".join([f"SOURCE {i+1}:\n{doc}" for i, doc in enumerate(context_docs)])
@@ -203,7 +224,14 @@ List any claims in the response that are:
 2. Contradicted by the sources
 3. Adequately supported by the sources
 
-Explain your reasoning for each assessment.
+FORMAT YOUR RESPONSE IN MARKDOWN:
+- Use ## for section headings
+- Use **bold** to highlight key findings
+- Use bullet points or numbered lists for claims
+- Consider using tables to organize results
+- Use `code blocks` for specific quotes being analyzed
+
+Explain your reasoning for each assessment clearly and in a structured format.
 """
         
         messages = [

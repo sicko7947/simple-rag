@@ -10,7 +10,6 @@ from langchain.schema import Document
 
 from src.data_ingestion.document_processor import DocumentProcessor
 from src.vector_store.supabase_store import SupabaseVectorStore
-from src.vector_store.supabase_store import SupabaseVectorStore
 from src.retriever.semantic_retriever import SemanticRetriever
 from src.retriever.query_expansion import QueryExpander
 from src.retriever.guardrails import GuardrailsValidator
@@ -29,12 +28,14 @@ class CognitiveAgent:
         self.document_processor = DocumentProcessor()
         # Use the factory to create the appropriate vector store
         self.vector_store = SupabaseVectorStore()
-        self.semantic_retriever = SemanticRetriever()
-        self.query_expander = QueryExpander()
-        self.guardrails = GuardrailsValidator()
+        # Initialize the model interface first so we can share it
+        self.model_interface = ModelInterface()
+        # Pass the vector_store and model_interface to components to avoid duplicate initialization
+        self.semantic_retriever = SemanticRetriever(vector_store=self.vector_store)
+        self.query_expander = QueryExpander(vector_store=self.vector_store)
+        self.guardrails = GuardrailsValidator(model_interface=self.model_interface)
         self.context_builder = ContextBuilder()
         self.prompt_manager = PromptManager()
-        self.model_interface = ModelInterface()
         self.knowledge_state = KnowledgeState()
         
         # Track conversation history
